@@ -5,13 +5,23 @@
 # leaves whose mode is EXACTLY 700. If something (e.g. the Windows guest or
 # Samba's shared-folder handling) sets the setgid bit on $HOME/Windows, the
 # shared leaf reads 2700 and every VM start is refused up-front, before Docker
-# is ever contacted ("Failed to start Windows VM!", no dockerd events).
+# is ever contacted ("Failed to start Windows VM!", no dockerd events). The
+# guest re-applies the bit after every run, so it is not a one-time event.
 #
 # Usage:
 #   omarchy-fix-windows-vm.sh           # clear bits, verify mounts, then launch
 #   omarchy-fix-windows-vm.sh --check   # only clear + verify, do not launch
+#   omarchy-fix-windows-vm.sh --install # permanently patch /usr/bin/omarchy-windows-vm
+#                                       # to tolerate the special bits (mask mode),
+#                                       # then verify with --check
+#
+# --install makes plain `omarchy-windows-vm launch` work WITHOUT this script,
+# until `omarchy update` reinstalls the packaged script - then run --install
+# again. The mask keeps the owner-only (0700) access check intact while ignoring
+# setgid/setuid/sticky, so the shared folder cannot block starts anymore.
 set -u
 
+SYSTEM_SCRIPT=/usr/bin/omarchy-windows-vm
 LEAVES_BASE="/var/lib/omarchy/windows/mounts/users/$(id -u)"
 STORAGE_SRC="$HOME/.windows"
 SHARED_SRC="$HOME/Windows"
@@ -19,6 +29,24 @@ STORAGE_LEAF="$LEAVES_BASE/storage"
 SHARED_LEAF="$LEAVES_BASE/shared"
 
 die() { printf 'omarchy-fix-windows-vm: %s\n' "$*" >&2; exit 1; }
+
+install_system_patch() {
+  [[ -f $SYSTEM_SCRIPT ]] || die "system script not found: $SYSTEM_SCRIPT"
+  echo "Applying mount-gate mask patch to $SYSTEM_SCRIPT (root)..."
+  pkexec bash -c '
+set -e
+F=/usr/bin/omarchy-windows-vm
+[ -f "$F" ] || exit 1
+[ -f "$F.omarchyfix.bak" ] || cp -a "$F" "$F.omarchyfix.bak"
+grep -q '\''${mode: -3} == 700'\'' "$F" ||
+  sed -i '\''s/\&\& \$mode == 700 \]\]/\&\& ${mode: -3} == 700 ]]/'\'' "$F"
+grep -q '\''${storage_mode: -3} != 700'\'' "$F" ||
+  sed -i '\''s/if \[\[ \$storage_mode != 700 || \$shared_mode != 700 \]\]; then/if [[ ${storage_mode: -3} != 700 || ${shared_mode: -3} != 700 ]]; then/'\'' "$F"
+bash -n "$F"
+' || { echo "Could not patch $SYSTEM_SCRIPT (authorization declined?)." >&2; return 1; }
+  grep -q '${mode: -3} == 700' "$SYSTEM_SCRIPT" || die "patch verification failed"
+  echo "Patched. Plain 'omarchy-windows-vm' now tolerates the setgid bit."
+}
 
 for src in "$STORAGE_SRC" "$SHARED_SRC"; do
   [[ -d $src && ! -L $src ]] || die "missing source dir: $src"
@@ -53,6 +81,14 @@ check_leaf() {
   echo "PASS [$name]"
 }
 
+case "${1:-}" in
+  --install)
+    install_system_patch || exit 1
+    ;;&
+  --check)
+    ;;
+esac
+
 ok=1
 check_leaf "$STORAGE_LEAF" "$STORAGE_SRC" storage || ok=0
 check_leaf "$SHARED_LEAF"  "$SHARED_SRC"  shared  || ok=0
@@ -60,12 +96,17 @@ check_leaf "$SHARED_LEAF"  "$SHARED_SRC"  shared  || ok=0
 
 echo "Windows VM mount gates are clean."
 
-if [[ ${1:-} == "--check" ]]; then
-  exit 0
-fi
+case "${1:-}" in
+  --check)
+    exit 0
+    ;;
+  --install)
+    exit 0
+    ;;
+esac
 
-if [[ -x /usr/share/omarchy/bin/omarchy-windows-vm ]]; then
+if [[ -x $SYSTEM_SCRIPT ]]; then
   echo "Launching the Windows VM..."
-  exec /usr/share/omarchy/bin/omarchy-windows-vm launch "$@"
+  exec "$SYSTEM_SCRIPT" launch "$@"
 fi
 die "omarchy-windows-vm not found"

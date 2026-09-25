@@ -21,14 +21,15 @@ cd omarchy-setup
 
 bash omarchy-set-nano-editor.sh           # 1. nano becomes the default text editor
 bash omarchy-setup-fingerprint.sh         # 2. full fingerprint setup (any reader)
-bash omarchy-fix-windows-vm.sh            # 3. repair + launch the Windows VM
+bash omarchy-fix-windows-vm.sh --install   # 3. one-time permanent fix for the Windows VM
+bash omarchy-fix-windows-vm.sh             #    (or use --check / plain launch)
 ```
 
 | Script | Flags |
 |--------|-------|
 | `omarchy-set-nano-editor.sh` | *(none)* set nano everywhere · `--revert` restore the previous editor |
 | `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--enroll` add/change fingerprints only · `--pam-only` wire PAM, skip install/enroll |
-| `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates, then launch · `--check` only clear + verify, do not launch |
+| `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates, then launch · `--check` only clear + verify, do not launch · `--install` patch the system script to tolerate the bits permanently (re-run after `omarchy update`) |
 
 Run fingerprint setup from a real terminal — it prompts for the sudo password, may build AUR
 packages (`yay`), and reads your finger from the sensor.
@@ -168,6 +169,15 @@ up-front — which is exactly the observed symptom (no container, no network, no
 
 Run it from a real terminal — the launch step prompts for root via polkit / fingerprint.
 
+> **Recurring? Run `--install`.** The Windows guest re-applies the setgid bit after every run, so
+> the plain clear+launch fix has to be repeated after each session. `--install` instead patches
+> the installed script `/usr/bin/omarchy-windows-vm` (backup `…/omarchy-windows-vm.omarchyfix.bak`)
+> to **mask the special bits** in both mount gates:
+> `mode == 700` → `${mode: -3} == 700` (and the same for the `prepare_caller_mounts` mode check).
+> The owner-only `0700` access check stays intact while setgid/setuid/sticky can no longer block a
+> start, so plain `omarchy-windows-vm launch` works every time — until `omarchy update` reinstalls
+> the packaged script, then run `--install` again.
+
 ### Verify
 
 ```bash
@@ -256,3 +266,4 @@ omarchy-pkg-aur-remove python-validity open-fprintd fprintd-clients
 | Revert nano default | `bash omarchy-set-nano-editor.sh --revert` |
 | Windows VM won't start | `bash omarchy-fix-windows-vm.sh` |
 | Check Windows VM mount gates | `bash omarchy-fix-windows-vm.sh --check` |
+| Make the fix permanent | `bash omarchy-fix-windows-vm.sh --install` |
