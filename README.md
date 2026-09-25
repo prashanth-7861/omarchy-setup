@@ -195,3 +195,19 @@ omarchy-pkg-aur-remove python-validity open-fprintd fprintd-clients
 | Enroll | `fprintd-enroll -f right-index-finger` |
 | Verify | `fprintd-verify && fprintd-list "$USER"` |
 | Default editor | `omarchy default editor` → state file `~/.local/state/omarchy/defaults/editor` → `nano` |
+
+---
+
+## Automated scripts
+
+Both tasks are also automated in idempotent bash scripts (also copied to `~/.local/bin/`):
+
+| Script | Usage |
+|--------|-------|
+| `omarchy-set-nano-editor.sh` | `bash omarchy-set-nano-editor.sh` — apply nano as default editor. `--revert` restores the previous editor. |
+| `omarchy-setup-fingerprint.sh` | `bash omarchy-setup-fingerprint.sh` — detect reader, install the right driver stack (python-validity vs fprintd/libfprint), enable services, enroll + verify, wire PAM. `--detect` only identifies the reader; `--pam-only` skips install/enroll. |
+
+```bash
+bash omarchy-set-nano-editor.sh          # make nano the default text editor
+bash omarchy-setup-fingerprint.sh        # full fingerprint setup (any reader)
+```
