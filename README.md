@@ -29,7 +29,7 @@ bash omarchy-fix-windows-vm.sh             #    (or use --check / plain launch)
 |--------|-------|
 | `omarchy-set-nano-editor.sh` | *(none)* set nano everywhere · `--revert` restore the previous editor |
 | `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--enroll` add/change fingerprints only · `--pam-only` wire PAM, skip install/enroll |
-| `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates, then launch · `--check` only clear + verify, do not launch · `--install` patch the system script to tolerate the bits permanently (re-run after `omarchy update`) |
+| `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates + launcher entry, then launch · `--check` only clear + verify, do not launch · `--install` patch the system script to tolerate the bits permanently (re-run after `omarchy update`) |
 
 Run fingerprint setup from a real terminal — it prompts for the sudo password, may build AUR
 packages (`yay`), and reads your finger from the sensor.
@@ -166,6 +166,11 @@ up-front — which is exactly the observed symptom (no container, no network, no
    them itself.
 3. If the gates are clean it **launches** `omarchy-windows-vm launch`; add `--check` to only
    clear + verify without launching (exit 0 on success, non-zero on a real failure).
+
+Every mode also checks the launcher shortcut `~/.local/share/applications/windows-vm.desktop`
+(the "Windows VM" app-menu icon). If it is missing or its `Exec=` does not run
+`omarchy-windows-vm launch`, the script recreates the canonical entry — fixing the
+"Failed to launch" desktop-shortcut symptom caused by the mount gate refusing to start the VM.
 
 Run it from a real terminal — the launch step prompts for root via polkit / fingerprint.
 

@@ -9,7 +9,8 @@
 # guest re-applies the bit after every run, so it is not a one-time event.
 #
 # Usage:
-#   omarchy-fix-windows-vm.sh           # clear bits, verify mounts, then launch
+#   omarchy-fix-windows-vm.sh           # clear bits, verify mounts + launcher entry,
+#                                       # then launch
 #   omarchy-fix-windows-vm.sh --check   # only clear + verify, do not launch
 #   omarchy-fix-windows-vm.sh --install # permanently patch /usr/bin/omarchy-windows-vm
 #                                       # to tolerate the special bits (mask mode),
@@ -19,6 +20,10 @@
 # until `omarchy update` reinstalls the packaged script - then run --install
 # again. The mask keeps the owner-only (0700) access check intact while ignoring
 # setgid/setuid/sticky, so the shared folder cannot block starts anymore.
+#
+# Every mode also verifies (and recreates if needed) the launcher entry
+# ~/.local/share/applications/windows-vm.desktop - the "Windows VM" icon that
+# otherwise reports "Failed to launch" when the mount gate blocks `up`.
 set -u
 
 SYSTEM_SCRIPT=/usr/bin/omarchy-windows-vm
@@ -27,8 +32,34 @@ STORAGE_SRC="$HOME/.windows"
 SHARED_SRC="$HOME/Windows"
 STORAGE_LEAF="$LEAVES_BASE/storage"
 SHARED_LEAF="$LEAVES_BASE/shared"
+DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/windows-vm.desktop"
 
 die() { printf 'omarchy-fix-windows-vm: %s\n' "$*" >&2; exit 1; }
+
+fix_desktop_entry() {
+  local dir exec_line
+  dir=$(dirname -- "$DESKTOP_FILE")
+  mkdir -p "$dir" 2>/dev/null || true
+  exec_line=$(grep -m1 '^Exec=' "$DESKTOP_FILE" 2>/dev/null || true)
+  if [[ $exec_line == *"omarchy-windows-vm launch"* ]]; then
+    echo "OK [desktop] $DESKTOP_FILE"
+    return 0
+  fi
+  cat > "$DESKTOP_FILE" <<'EOF'
+[Desktop Entry]
+Name=Windows
+Comment=Start Windows VM via Docker and connect with RDP
+Exec=uwsm app -- omarchy-windows-vm launch
+Icon=windows
+Terminal=false
+Type=Application
+Categories=System;Virtualization;
+EOF
+  chmod 0644 "$DESKTOP_FILE"
+  command -v update-desktop-database >/dev/null 2>&1 \
+    && update-desktop-database "$dir" >/dev/null 2>&1 || true
+  echo "REPAIRED [desktop] recreated $DESKTOP_FILE"
+}
 
 install_system_patch() {
   [[ -f $SYSTEM_SCRIPT ]] || die "system script not found: $SYSTEM_SCRIPT"
@@ -95,6 +126,8 @@ check_leaf "$SHARED_LEAF"  "$SHARED_SRC"  shared  || ok=0
 [[ $ok == 1 ]] || die "mount gates not satisfied; Windows VM cannot start safely"
 
 echo "Windows VM mount gates are clean."
+
+fix_desktop_entry
 
 case "${1:-}" in
   --check)
