@@ -22,6 +22,7 @@
 # Usage:
 #   bash omarchy-setup-fingerprint.sh                 # full setup
 #   bash omarchy-setup-fingerprint.sh --detect        # only identify the reader
+#   bash omarchy-setup-fingerprint.sh --enroll        # add/change fingerprints only
 #   bash omarchy-setup-fingerprint.sh --pam-only      # skip install/enroll, just wire PAM
 
 set -euo pipefail
@@ -30,13 +31,16 @@ VALIDITY_IDS="138a:0090 138a:0097 138a:009d 06cb:009a"
 GATE="auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed"
 LOCK_FILE="/etc/pam.d/omarchy-lock-fingerprint"
 
+FINGER_NAMES=(left-thumb left-index-finger left-middle-finger left-ring-finger left-little-finger \
+              right-thumb right-index-finger right-middle-finger right-ring-finger right-little-finger)
+
 _READER_LINE=""
 _READER_ID=""
 _READER_DESC=""
 STACK=""
 
 usage() {
-  echo "Usage: bash $0 [--detect|--pam-only]"
+  echo "Usage: bash $0 [--detect|--enroll|--pam-only]"
   exit "${1:-0}"
 }
 
@@ -117,17 +121,57 @@ enable_services() {
 }
 
 # --- 4. enroll + verify -----------------------------------------------------
+enrolled_list() {
+  fprintd-list "$USER" 2>/dev/null | grep '^- #' | sed 's/.*: *//'
+}
+
+enroll_one() {
+  local finger="$1"
+  info "Enrolling $finger. Keep touching/moving your finger until it completes."
+  sudo fprintd-enroll -f "$finger" "$USER" \
+    || warn "Enrollment of $finger failed — run again to retry."
+  info "Verifying $finger..."
+  fprintd-verify -f "$finger" && info "$finger verified." \
+    || warn "Verification of $finger failed — try again next run."
+}
+
 enroll_finger() {
-  local enrolled=0 ans
-  enrolled="$(fprintd-list "$USER" 2>/dev/null | grep -c '^- #' || true)"
-  if [[ "$enrolled" -gt 0 ]]; then
-    read -r -p "A finger is already enrolled ($enrolled). Re-enroll/add anyway? [y/N] " ans
-    [[ "${ans,,}" == "y" ]] || { info "Skipping enrollment."; return 0; }
+  local -a enrolled=() sel=()
+  local choice c i f
+
+  mapfile -t enrolled < <(enrolled_list)
+  echo
+  if [[ ${#enrolled[@]} -gt 0 ]]; then
+    info "Already enrolled: ${enrolled[*]}"
+  else
+    info "No fingerprints enrolled yet."
   fi
-  info "Enrolling. Keep touching/moving your finger on the sensor until it completes."
-  sudo fprintd-enroll "$USER" || die "Enrollment failed. Run again to re-enroll."
-  info "Verifying..."
-  fprintd-verify || warn "Verification failed — try re-running this script."
+
+  echo
+  echo "Select fingers to enroll (numbers may be combined, e.g. '1 3 5', or 'all'):"
+  for i in "${!FINGER_NAMES[@]}"; do
+    printf '  %2d) %s\n' "$((i+1))" "${FINGER_NAMES[$i]}"
+  done
+  echo
+  read -r -p "=> " choice
+  [[ -z "$choice" ]] && { info "Nothing to enroll."; return 0; }
+  if [[ "$choice" == "all" || "$choice" == "*" ]]; then
+    choice="$(seq 1 "${#FINGER_NAMES[@]}")"
+  fi
+
+  for c in $choice; do
+    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#FINGER_NAMES[@]} )); then
+      sel+=("${FINGER_NAMES[c-1]}")
+    else
+      warn "ignoring invalid choice '$c'"
+    fi
+  done
+  (( ${#sel[@]} )) || { warn "no valid fingers selected."; return 1; }
+
+  info "Enrolling: ${sel[*]}"
+  for f in "${sel[@]}"; do
+    enroll_one "$f"
+  done
 }
 
 # --- 5. PAM -----------------------------------------------------------------
@@ -189,6 +233,7 @@ MODE="full"
 case "${1:-}" in
   ""|--full) MODE="full" ;;
   --detect)  MODE="detect" ;;
+  --enroll)  MODE="enroll" ;;
   --pam-only) MODE="pam-only" ;;
   -h|--help) usage ;;
   *) die "unknown argument '$1'";;
@@ -214,6 +259,16 @@ if [[ "$MODE" == "detect" ]]; then
   echo
   echo "Detection only — nothing was installed or changed."
   echo "Run with no arguments (or --full) to perform the full setup."
+  exit 0
+fi
+
+if [[ "$MODE" == "enroll" ]]; then
+  if stack_missing; then
+    die "driver stack not installed yet — run the full setup first."
+  fi
+  enroll_finger
+  echo
+  info "Enrollment update finished. Current prints: $(fprintd-list "$USER" 2>/dev/null | grep -c '^- #' || true)"
   exit 0
 fi
 

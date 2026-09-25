@@ -23,7 +23,7 @@ bash omarchy-setup-fingerprint.sh         # 2. full fingerprint setup (any reade
 | Script | Flags |
 |--------|-------|
 | `omarchy-set-nano-editor.sh` | *(none)* set nano everywhere · `--revert` restore the previous editor |
-| `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--pam-only` wire PAM, skip install/enroll |
+| `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--enroll` add/change fingerprints only · `--pam-only` wire PAM, skip install/enroll |
 
 Run fingerprint setup from a real terminal — it prompts for the sudo password, may build AUR
 packages (`yay`), and reads your finger from the sensor.
@@ -86,8 +86,9 @@ drive.
 2. **Enable services** — `open-fprintd.service` + `python3-validity.service` (+
    `python3-validity-suspend-hotfix.service` for the lid/suspend firmware fix), or `fprintd.service`.
    `open-fprintd` owns the `net.reactivated.Fprint` D-Bus name (it replaces plain `fprintd`).
-3. **Enroll + verify** — `fprintd-enroll -f …` then `fprintd-verify`; skips if a finger is already
-   enrolled (ask first).
+3. **Enroll + verify** — interactive menu of the 10 standard finger names; pick one or more
+   (e.g. `2 5`, or `all`) to enroll, each verified by `fprintd-verify -f`. Re-running with
+   `--enroll` adds or replaces prints without touching the installed stack or PAM.
 4. **Wire PAM** for `sudo`, `polkit-1`, and the Omarchy lock screen (`omarchy-lock-fingerprint`).
 
 ### PAM wiring (what gets written)
@@ -187,6 +188,7 @@ omarchy-pkg-aur-remove python-validity open-fprintd fprintd-clients
 | Detect reader | `lsusb \| grep -i fingerprint` |
 | nano as default editor | `bash omarchy-set-nano-editor.sh` |
 | Full fingerprint setup | `bash omarchy-setup-fingerprint.sh` |
+| Enroll more fingerprints | `bash omarchy-setup-fingerprint.sh --enroll` |
 | Identify reader only | `bash omarchy-setup-fingerprint.sh --detect` |
 | Wire PAM only | `bash omarchy-setup-fingerprint.sh --pam-only` |
 | Revert nano default | `bash omarchy-set-nano-editor.sh --revert` |
