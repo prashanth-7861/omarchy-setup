@@ -1,10 +1,13 @@
-# Omarchy System Setup — nano default editor & fingerprint authentication
+# Omarchy System Setup — nano default editor, fingerprint auth & Windows VM repair
 
-Two idempotent bash scripts automate common machine setup on **Omarchy** (Arch-based):
+Three idempotent bash scripts automate common machine setup on **Omarchy** (Arch-based):
 
 1. `omarchy-set-nano-editor.sh` — make **nano** the default text editor (instead of vim/neovim).
 2. `omarchy-setup-fingerprint.sh` — detect the fingerprint reader on **any** device, install the
    matching driver stack, enroll + verify a finger, and wire PAM for sudo/polkit/lock screen.
+3. `omarchy-fix-windows-vm.sh` — repair the `windows-vm` mount gates after the guest (or Samba)
+   set a setgid bit on the shared folder, which makes `omarchy-windows-vm launch` refuse to start
+   the VM; then launches it.
 
 Tested on a ThinkPad T480 running Omarchy (kernel `7.2.5-3-omarchy`).
 
@@ -18,12 +21,14 @@ cd omarchy-setup
 
 bash omarchy-set-nano-editor.sh           # 1. nano becomes the default text editor
 bash omarchy-setup-fingerprint.sh         # 2. full fingerprint setup (any reader)
+bash omarchy-fix-windows-vm.sh            # 3. repair + launch the Windows VM
 ```
 
 | Script | Flags |
 |--------|-------|
 | `omarchy-set-nano-editor.sh` | *(none)* set nano everywhere · `--revert` restore the previous editor |
 | `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--enroll` add/change fingerprints only · `--pam-only` wire PAM, skip install/enroll |
+| `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates, then launch · `--check` only clear + verify, do not launch |
 
 Run fingerprint setup from a real terminal — it prompts for the sudo password, may build AUR
 packages (`yay`), and reads your finger from the sensor.
@@ -121,6 +126,63 @@ account    include                     system-local-login
 
 ---
 
+## 3. `omarchy-fix-windows-vm.sh` — repair & relaunch the Windows VM
+
+### Symptom
+
+`omarchy-windows-vm launch` fails right after a previous session:
+
+```
+❌ Failed to start Windows VM!
+```
+
+`omarchy-windows-vm stop` still works, but starting fails **instantly** and the Docker daemon
+logs show nothing — the failure happens before Docker is ever contacted.
+
+### Root cause
+
+`omarchy-windows-vm`'s `assert_mounts_safe` → `mounted_leaf_matches()` requires every VM mount
+leaf to have a mode **exactly `700`** (`bin/omarchy-windows-vm`):
+
+```bash
+[[ $actual == "$identity" && $owner == "$CALLER_UID" && $mode == 700 ]]
+```
+
+For a bind mount, the leaf at `/var/lib/omarchy/windows/mounts/users/1000/shared` mirrors the
+source folder `~/Windows`. If the Windows guest (or Samba's shared-folder handling) sets the
+**setgid bit** on `~/Windows`, the leaf reads `2700`, the check fails, and every `up` is refused
+up-front — which is exactly the observed symptom (no container, no network, nothing in dockerd).
+
+### What the script does
+
+1. **Clears the special bits** (`chmod g-s` then `0700`) on `~/.windows` and `~/Windows` — the
+   bind-mounted leaves mirror the fix automatically.
+2. **Verifies the same gate the launcher uses**, for both `storage` and `shared` leaves:
+   - anchor resolves & is a real single-layer bind mount,
+   - leaf device:inode == source (`mounted_leaf_matches`),
+   - leaf owner == caller uid, leaf mode == `700`.
+   Missing or unmounted anchors are **SKIP**ped, not failed — the launcher re-creates and binds
+   them itself.
+3. If the gates are clean it **launches** `omarchy-windows-vm launch`; add `--check` to only
+   clear + verify without launching (exit 0 on success, non-zero on a real failure).
+
+Run it from a real terminal — the launch step prompts for root via polkit / fingerprint.
+
+### Verify
+
+```bash
+bash omarchy-fix-windows-vm.sh --check   # prints: PASS [storage] PASS [shared]
+stat -c '%a' ~/Windows                   # 700 (was 2700 with the bug)
+```
+
+### Upstream note
+
+The strict `mode == 700` test is a one-line hardening change upstream: masking the special bits
+(`${mode: -3} == 700`) makes `mounted_leaf_matches` tolerate setgid/setuid sticky bits on the
+host-side shared folder while keeping the access check intact.
+
+---
+
 ## Reference machine state
 
 Full USB scan (T480):
@@ -192,3 +254,5 @@ omarchy-pkg-aur-remove python-validity open-fprintd fprintd-clients
 | Identify reader only | `bash omarchy-setup-fingerprint.sh --detect` |
 | Wire PAM only | `bash omarchy-setup-fingerprint.sh --pam-only` |
 | Revert nano default | `bash omarchy-set-nano-editor.sh --revert` |
+| Windows VM won't start | `bash omarchy-fix-windows-vm.sh` |
+| Check Windows VM mount gates | `bash omarchy-fix-windows-vm.sh --check` |
