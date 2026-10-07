@@ -422,6 +422,29 @@ reset_sensor() {
     warn "/usr/share/python-validity/playground/factory-reset.py not installed."
   fi
 
+  # Rebind the USB device so firmware upload can find it
+  info "Rebinding USB device for firmware upload..."
+  local dev_path
+  for dev_path in /sys/bus/usb/devices/*/idVendor; do
+    [[ -r "$dev_path" ]] || continue
+    if [[ "$(cat "$dev_path" 2>/dev/null)" == "06cb" ]]; then
+      local id_prod="${dev_path%/idVendor}/idProduct"
+      [[ "$(cat "$id_prod" 2>/dev/null)" == "009a" ]] || continue
+      local uevent="${dev_path%/idVendor}/uevent"
+      local devnum
+      devnum=$(grep '^DEVNUM=' "$uevent" 2>/dev/null | cut -d= -f2)
+      local busnum
+      busnum=$(grep '^BUSNUM=' "$uevent" 2>/dev/null | cut -d= -f2)
+      [[ -n "$devnum" && -n "$busnum" ]] || continue
+      local buspath="/sys/bus/usb/devices/${busnum}-$(printf '%03d' "$devnum")"
+      if [[ -e "/sys/bus/usb/drivers/usbhid/bind" ]]; then
+        info "Rebinding kernel driver to sensor..."
+        echo "${busnum}-$(printf '%03d' "$devnum")" | sudo tee /sys/bus/usb/drivers/usbhid/bind >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+  sleep 2
+
   if command -v validity-sensors-firmware >/dev/null 2>&1; then
     info "Refreshing sensor firmware (needs network)..."
     sudo validity-sensors-firmware || warn "validity-sensors-firmware failed — continuing"
