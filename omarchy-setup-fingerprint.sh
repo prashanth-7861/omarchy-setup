@@ -238,7 +238,7 @@ enroll_one() {
     return 1
   fi
   info "Verifying $finger (place the same finger on the sensor)..."
-  if fprintd-verify -f "$finger"; then
+  if fprintd-verify -f "$finger" 2>&1 | grep -q 'verify-match'; then
     info "$finger verified."
     VERIFY_OK=1
   else
@@ -407,9 +407,9 @@ verify_finger() {
 
   info "Verifying $f — place your finger on the sensor..."
   if [[ "$f" == "any" ]]; then
-    fprintd-verify && VERIFY_OK=1
+    fprintd-verify 2>&1 | grep -q 'verify-match' && VERIFY_OK=1
   else
-    fprintd-verify -f "$f" && VERIFY_OK=1
+    fprintd-verify -f "$f" 2>&1 | grep -q 'verify-match' && VERIFY_OK=1
   fi
 }
 
