@@ -379,16 +379,40 @@ reset_sensor() {
   esac
 
   kill_clients
-  info "Stopping the driver..."
+  info "Stopping and masking driver services..."
   sudo systemctl stop python3-validity.service open-fprintd.service 2>/dev/null || true
+  sudo systemctl mask python3-validity.service open-fprintd.service 2>/dev/null || true
   sleep 2
 
-  # Wait for USB device to be fully released
-  local i=0
-  while fuser /dev/bus/usb/*/* 2>/dev/null | grep -q "python3-validity\|open-fprintd" && (( i < 10 )); do
-    sleep 1
-    ((i++))
+  # Find and unbind the USB device (06cb:009a)
+  info "Releasing USB device..."
+  local dev_path
+  for dev_path in /sys/bus/usb/devices/*/idVendor; do
+    [[ -r "$dev_path" ]] || continue
+    if [[ "$(cat "$dev_path" 2>/dev/null)" == "06cb" ]]; then
+      local id_prod="${dev_path%/idVendor}/idProduct"
+      [[ "$(cat "$id_prod" 2>/dev/null)" == "009a" ]] || continue
+      local uevent="${dev_path%/idVendor}/uevent"
+      local devnum
+      devnum=$(grep '^DEVNUM=' "$uevent" 2>/dev/null | cut -d= -f2)
+      local busnum
+      busnum=$(grep '^BUSNUM=' "$uevent" 2>/dev/null | cut -d= -f2)
+      [[ -n "$devnum" && -n "$busnum" ]] || continue
+      local buspath="/sys/bus/usb/devices/${busnum}-$(printf '%03d' "$devnum")"
+      if [[ -e "$buspath/driver/unbind" ]]; then
+        info "Unbinding kernel driver from sensor..."
+        echo "${busnum}-$(printf '%03d' "$devnum")" | sudo tee "$buspath/driver/unbind" >/dev/null 2>&1 || true
+      fi
+      # Also unbind from usbhid if bound
+      if [[ -e "/sys/bus/usb/drivers/usbhid/unbind" ]]; then
+        echo "${busnum}-$(printf '%03d' "$devnum")" | sudo tee /sys/bus/usb/drivers/usbhid/unbind >/dev/null 2>&1 || true
+      fi
+    fi
   done
+
+  # Kill any remaining processes using the USB device
+  sudo fuser -k /dev/bus/usb/*/* 2>/dev/null | grep -v "Cannot stat" || true
+  sleep 2
 
   if [[ -f /usr/share/python-validity/playground/factory-reset.py ]]; then
     info "Factory-resetting the sensor chip..."
@@ -403,6 +427,7 @@ reset_sensor() {
     sudo validity-sensors-firmware || warn "validity-sensors-firmware failed — continuing"
   fi
 
+  sudo systemctl unmask python3-validity.service open-fprintd.service 2>/dev/null || true
   sudo systemctl start python3-validity.service open-fprintd.service
   sleep 3
 
