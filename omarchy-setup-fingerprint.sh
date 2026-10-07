@@ -144,6 +144,10 @@ install_stack() {
 enable_services() {
   if [[ "$STACK" == "validity" ]]; then
     info "Enabling open-fprintd + python3-validity services..."
+    # Upload firmware first (needs device free), then start services
+    if ! sensor_present_after_start; then
+      upload_firmware
+    fi
     sudo systemctl enable --now open-fprintd.service python3-validity.service 2>/dev/null \
       || sudo systemctl start open-fprintd.service python3-validity.service
     if [[ -f /usr/lib/systemd/system/python3-validity-suspend-hotfix.service ]]; then
@@ -152,12 +156,22 @@ enable_services() {
     for s in open-fprintd-suspend.service open-fprintd-resume.service; do
       [[ -f "/usr/lib/systemd/system/$s" ]] && sudo systemctl enable "$s" 2>/dev/null || true
     done
-    sensor_present || upload_firmware || warn "no sensor visible — check python3-validity status"
   else
     info "Enabling fprintd service..."
     sudo systemctl enable --now fprintd.service 2>/dev/null \
       || sudo systemctl start fprintd.service
   fi
+}
+
+sensor_present_after_start() {
+  # Try starting temporarily to check sensor, then stop
+  sudo systemctl start open-fprintd.service python3-validity.service 2>/dev/null || true
+  sleep 2
+  local present=0
+  timeout 10 fprintd-list "$USER" 2>/dev/null | grep -q 'Device at' && present=1
+  sudo systemctl stop open-fprintd.service python3-validity.service 2>/dev/null || true
+  sleep 1
+  return $present
 }
 
 sensor_present() {
@@ -166,9 +180,8 @@ sensor_present() {
 
 upload_firmware() {
   command -v validity-sensors-firmware >/dev/null 2>&1 || return 1
-  info "Driver sees no sensor — uploading firmware with validity-sensors-firmware..."
+  info "Sensor not detected — uploading firmware with validity-sensors-firmware..."
   sudo validity-sensors-firmware || return 1
-  sudo systemctl restart python3-validity.service open-fprintd.service || true
   sleep 2
   sensor_present
 }
@@ -368,12 +381,14 @@ reset_sensor() {
   kill_clients
   info "Stopping the driver..."
   sudo systemctl stop python3-validity.service open-fprintd.service 2>/dev/null || true
-  sleep 1
+  sleep 2
 
-  if command -v validity-sensors-firmware >/dev/null 2>&1; then
-    info "Refreshing sensor firmware (needs network)..."
-    sudo validity-sensors-firmware || warn "validity-sensors-firmware failed — continuing"
-  fi
+  # Wait for USB device to be fully released
+  local i=0
+  while fuser /dev/bus/usb/*/* 2>/dev/null | grep -q "python3-validity\|open-fprintd" && (( i < 10 )); do
+    sleep 1
+    ((i++))
+  done
 
   if [[ -f /usr/share/python-validity/playground/factory-reset.py ]]; then
     info "Factory-resetting the sensor chip..."
@@ -383,8 +398,21 @@ reset_sensor() {
     warn "/usr/share/python-validity/playground/factory-reset.py not installed."
   fi
 
+  if command -v validity-sensors-firmware >/dev/null 2>&1; then
+    info "Refreshing sensor firmware (needs network)..."
+    sudo validity-sensors-firmware || warn "validity-sensors-firmware failed — continuing"
+  fi
+
   sudo systemctl start python3-validity.service open-fprintd.service
-  sleep 2
+  sleep 3
+
+  # Wait for sensor to appear
+  local tries=0
+  while ! timeout 5 fprintd-list "$USER" 2>/dev/null | grep -q 'Device at' && (( tries < 10 )); do
+    sleep 1
+    ((tries++))
+  done
+
   timeout 15 fprintd-delete "$USER" 2>/dev/null || true
   info "Sensor wiped. Re-run the script to enroll a finger."
 }
