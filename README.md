@@ -28,7 +28,7 @@ bash omarchy-fix-windows-vm.sh             #    (or use --check / plain launch)
 | Script | Flags |
 |--------|-------|
 | `omarchy-set-nano-editor.sh` | *(none)* set nano everywhere · `--revert` restore the previous editor |
-| `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify the reader only · `--enroll` add/change fingerprints only · `--pam-only` wire PAM, skip install/enroll |
+| `omarchy-setup-fingerprint.sh` | *(none/`--full`)* full setup · `--detect` identify reader · `--enroll` add/change prints · `--verify` test a finger · `--reset` factory-reset sensor · `--remove` delete a finger · `--list` list prints · `--status` full config status · `--disable` disable fingerprint PAM · `--enable` re-enable PAM · `--uninstall` remove everything · `--pam-only` wire PAM only |
 | `omarchy-fix-windows-vm.sh` | *(none)* clear bits, verify mount gates + launcher entry, then launch · `--check` only clear + verify, do not launch · `--install` patch the system script to tolerate the bits permanently (re-run after `omarchy update`) |
 
 Run fingerprint setup from a real terminal — it prompts for the sudo password, may build AUR
@@ -124,6 +124,24 @@ account    include                     system-local-login
 - Run any `sudo` command → fingerprint or password.
 - Lock the screen (`omarchy lock`) → unlock with a finger.
 - GUI auth prompts (polkit) → fingerprint accepted.
+
+### Troubleshooting Validity/Synaptics sensors (06cb:009a, 138a:xxxx)
+
+The python-validity driver stores templates **on the sensor chip**. Known issues:
+
+1. **Duplicate record (04c3)** — re-enrolling the same finger fails. The script now auto-clears
+   existing prints before re-enrolling on the validity stack.
+2. **Stale records** — old enrollments cause verify to return `no-match` forever.
+   Run `--reset` to factory-reset the sensor chip (uploads firmware, wipes DB).
+3. **Device already in use** — a hung `fprintd-verify` holds the device claim.
+   The script kills stale clients and restarts `open-fprintd` before every operation.
+
+```bash
+bash omarchy-setup-fingerprint.sh --reset    # wipe sensor + local DB
+bash omarchy-setup-fingerprint.sh            # re-enroll fresh
+bash omarchy-setup-fingerprint.sh --verify   # test without re-enrolling
+bash omarchy-setup-fingerprint.sh --status   # show full config status
+```
 
 ---
 
@@ -266,6 +284,14 @@ omarchy-pkg-aur-remove python-validity open-fprintd fprintd-clients
 | nano as default editor | `bash omarchy-set-nano-editor.sh` |
 | Full fingerprint setup | `bash omarchy-setup-fingerprint.sh` |
 | Enroll more fingerprints | `bash omarchy-setup-fingerprint.sh --enroll` |
+| Verify a finger | `bash omarchy-setup-fingerprint.sh --verify` |
+| Factory-reset sensor | `bash omarchy-setup-fingerprint.sh --reset` |
+| Remove a finger / all | `bash omarchy-setup-fingerprint.sh --remove` |
+| List enrolled prints | `bash omarchy-setup-fingerprint.sh --list` |
+| Full status (pkgs, svcs, PAM, prints) | `bash omarchy-setup-fingerprint.sh --status` |
+| Disable fingerprint PAM | `bash omarchy-setup-fingerprint.sh --disable` |
+| Re-enable fingerprint PAM | `bash omarchy-setup-fingerprint.sh --enable` |
+| Uninstall everything | `bash omarchy-setup-fingerprint.sh --uninstall` |
 | Identify reader only | `bash omarchy-setup-fingerprint.sh --detect` |
 | Wire PAM only | `bash omarchy-setup-fingerprint.sh --pam-only` |
 | Revert nano default | `bash omarchy-set-nano-editor.sh --revert` |
