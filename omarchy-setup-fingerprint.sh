@@ -22,8 +22,24 @@
 # Usage:
 #   bash omarchy-setup-fingerprint.sh                 # full setup
 #   bash omarchy-setup-fingerprint.sh --detect        # only identify the reader
-#   bash omarchy-setup-fingerprint.sh --enroll        # add/change fingerprints only
+#   bash omarchy-setup-fingerprint.sh --enroll        # add/change fingerprints
+#   bash omarchy-setup-fingerprint.sh --verify        # test a finger, wire PAM if it matches
+#   bash omarchy-setup-fingerprint.sh --reset         # wipe the sensor chip + stored prints
+#   bash omarchy-setup-fingerprint.sh --remove        # remove a specific finger or all
+#   bash omarchy-setup-fingerprint.sh --list          # list enrolled fingerprints
+#   bash omarchy-setup-fingerprint.sh --status        # show full configuration status
+#   bash omarchy-setup-fingerprint.sh --disable       # disable fingerprint PAM (keep enrolled)
+#   bash omarchy-setup-fingerprint.sh --enable        # re-enable fingerprint PAM
+#   bash omarchy-setup-fingerprint.sh --uninstall     # remove packages, PAM, services
 #   bash omarchy-setup-fingerprint.sh --pam-only      # skip install/enroll, just wire PAM
+#
+# Notes on the Validity/Synaptics stack (python-validity):
+#   * It stores records on the sensor itself. Re-enrolling a finger that is
+#     already stored fails with "Failed: 04c3" (duplicate record), so the
+#     script deletes existing prints before enrolling them again.
+#   * A chip whose records went stale (old enrollments, interrupted runs)
+#     enrolls fine but never matches on verify. --reset runs the documented
+#     factory-reset sequence to clear it; then enroll fresh.
 
 set -euo pipefail
 
@@ -38,9 +54,10 @@ _READER_LINE=""
 _READER_ID=""
 _READER_DESC=""
 STACK=""
+VERIFY_OK=0
 
 usage() {
-  echo "Usage: bash $0 [--detect|--enroll|--pam-only]"
+  echo "Usage: bash $0 [--detect|--enroll|--verify|--reset|--remove|--list|--status|--disable|--enable|--uninstall|--pam-only]"
   exit "${1:-0}"
 }
 
@@ -78,8 +95,13 @@ classify() {
 # --- 2. install -------------------------------------------------------------
 stack_missing() {
   if [[ "$STACK" == "validity" ]]; then
-    command -v fprintd-enroll >/dev/null 2>&1 && \
-    [[ -f /usr/lib/systemd/system/python3-validity.service ]] && return 1
+    # fprintd-clients-git ships fprintd-enroll/pam_fprintd and replaces the
+    # stock fprintd package; both installed at once means a half-migrated
+    # system where the daemon and the PAM module disagree.
+    command -v fprintd-enroll >/dev/null 2>&1 &&
+      [[ -f /usr/lib/systemd/system/open-fprintd.service ]] &&
+      [[ -f /usr/lib/systemd/system/python3-validity.service ]] &&
+      ! pacman -Q fprintd >/dev/null 2>&1 && return 1
   else
     command -v fprintd-enroll >/dev/null 2>&1 && \
     [[ -f /usr/lib/systemd/system/fprintd.service ]] && return 1
@@ -87,8 +109,22 @@ stack_missing() {
   return 0
 }
 
+remove_conflicting_stack() {
+  local p
+  # fprintd-clients-git conflicts with stock fprintd (same binaries and
+  # pam_fprintd.so). With --noconfirm pacman answers the conflict prompt "N"
+  # and aborts, leaving the install half-done.
+  for p in fprintd libfprint-git; do
+    if pacman -Q "$p" >/dev/null 2>&1; then
+      info "Removing $p (the validity stack ships its own fprintd clients)..."
+      sudo pacman -Rns --noconfirm "$p" || warn "could not remove $p — remove it manually"
+    fi
+  done
+}
+
 install_stack() {
   if [[ "$STACK" == "validity" ]]; then
+    remove_conflicting_stack
     if command -v omarchy-pkg-aur-add >/dev/null 2>&1; then
       info "Installing python-validity stack via omarchy-pkg-aur-add (yay)..."
       omarchy-pkg-aur-add python-validity
@@ -113,6 +149,10 @@ enable_services() {
     if [[ -f /usr/lib/systemd/system/python3-validity-suspend-hotfix.service ]]; then
       sudo systemctl enable python3-validity-suspend-hotfix.service 2>/dev/null || true
     fi
+    for s in open-fprintd-suspend.service open-fprintd-resume.service; do
+      [[ -f "/usr/lib/systemd/system/$s" ]] && sudo systemctl enable "$s" 2>/dev/null || true
+    done
+    sensor_present || upload_firmware || warn "no sensor visible — check python3-validity status"
   else
     info "Enabling fprintd service..."
     sudo systemctl enable --now fprintd.service 2>/dev/null \
@@ -120,24 +160,96 @@ enable_services() {
   fi
 }
 
+sensor_present() {
+  timeout 10 fprintd-list "$USER" 2>/dev/null | grep -q 'Device at'
+}
+
+upload_firmware() {
+  command -v validity-sensors-firmware >/dev/null 2>&1 || return 1
+  info "Driver sees no sensor — uploading firmware with validity-sensors-firmware..."
+  sudo validity-sensors-firmware || return 1
+  sudo systemctl restart python3-validity.service open-fprintd.service || true
+  sleep 2
+  sensor_present
+}
+
 # --- 4. enroll + verify -----------------------------------------------------
+# A previous run (or a manual fprintd-verify left waiting for a finger) keeps
+# the device claimed, and every later call fails with "Device is already in
+# use". Drop the stale clients and restart the broker to clear the claim.
+kill_clients() {
+  pkill -x fprintd-enroll 2>/dev/null || true
+  pkill -x fprintd-verify 2>/dev/null || true
+  pkill -x fprintd-list 2>/dev/null || true
+  pkill -x fprintd-delete 2>/dev/null || true
+  sleep 1
+}
+
+release_device() {
+  kill_clients
+  if [[ "$STACK" == "validity" ]]; then
+    sudo systemctl restart open-fprintd.service 2>/dev/null || true
+    sleep 1
+  fi
+}
+
 enrolled_list() {
-  fprintd-list "$USER" 2>/dev/null | grep '^- #' | sed 's/.*: *//'
+  timeout 10 fprintd-list "$USER" 2>/dev/null | grep '^- #' | sed 's/.*: *//'
+}
+
+delete_all_prints() {
+  info "Deleting all enrolled fingerprints for $USER..."
+  timeout 15 fprintd-delete "$USER" 2>/dev/null \
+    || warn "fprintd-delete failed — the sensor may still hold old records."
+}
+
+# python-validity keeps its records on the sensor. Enrolling a finger that is
+# already there fails with "Failed: 04c3" (duplicate record), and stale
+# records make verify return no-match forever, so start from a clean slate.
+clear_for_enroll() {
+  local -a already=("$@")
+  [[ ${#already[@]} -eq 0 ]] && return 0
+
+  if [[ "$STACK" == "validity" ]]; then
+    warn "Already enrolled: ${already[*]}"
+    info "This driver cannot overwrite a stored record, so all prints are cleared first."
+    local ans
+    read -r -p "Clear the existing fingerprints and re-enroll? [Y/n] " ans
+    case "${ans,,}" in
+      n|no) return 1 ;;
+    esac
+    release_device
+    delete_all_prints
+    release_device
+  else
+    local f
+    for f in "${already[@]}"; do
+      timeout 15 fprintd-delete -f "$f" "$USER" 2>/dev/null || true
+    done
+  fi
 }
 
 enroll_one() {
   local finger="$1"
+  release_device
   info "Enrolling $finger. Keep touching/moving your finger until it completes."
-  sudo fprintd-enroll -f "$finger" "$USER" \
-    || warn "Enrollment of $finger failed — run again to retry."
-  info "Verifying $finger..."
-  fprintd-verify -f "$finger" && info "$finger verified." \
-    || warn "Verification of $finger failed — try again next run."
+  if ! sudo fprintd-enroll -f "$finger" "$USER"; then
+    warn "Enrollment of $finger failed — run --enroll again to retry."
+    return 1
+  fi
+  info "Verifying $finger (place the same finger on the sensor)..."
+  if fprintd-verify -f "$finger"; then
+    info "$finger verified."
+    VERIFY_OK=1
+  else
+    warn "Verification of $finger failed — run --verify to try again."
+    return 1
+  fi
 }
 
 enroll_finger() {
-  local -a enrolled=() sel=()
-  local choice c i f
+  local -a enrolled=() sel=() clash=()
+  local choice c i f ans
 
   mapfile -t enrolled < <(enrolled_list)
   echo
@@ -168,9 +280,17 @@ enroll_finger() {
   done
   (( ${#sel[@]} )) || { warn "no valid fingers selected."; return 1; }
 
+  for f in "${sel[@]}"; do
+    [[ " ${enrolled[*]-} " == *" $f "* ]] && clash+=("$f")
+  done
+  if (( ${#clash[@]} )) && ! clear_for_enroll "${clash[@]}"; then
+    info "Keeping the existing prints unchanged; skipping re-enroll."
+    return 0
+  fi
+
   info "Enrolling: ${sel[*]}"
   for f in "${sel[@]}"; do
-    enroll_one "$f"
+    enroll_one "$f" || true
   done
 }
 
@@ -228,12 +348,215 @@ EOF
   fi
 }
 
+# --- 6. reset + verify ---------------------------------------------------------------
+# python-validity can leave the chip holding records from earlier runs (or
+# from a different install). Those make verify return no-match forever and
+# make a second enroll fail with "Failed: 04c3". This is the sequence from
+# the upstream README: stop the driver, refresh the firmware, wipe the chip.
+reset_sensor() {
+  [[ "$STACK" == "validity" ]] \
+    || die "--reset only applies to the validity (python-validity) stack."
+
+  warn "This wipes every fingerprint stored on the sensor chip."
+  local ans
+  read -r -p "Factory-reset the sensor? [y/N] " ans
+  case "${ans,,}" in
+    y|yes) ;;
+    *) info "Aborted."; return 0 ;;
+  esac
+
+  kill_clients
+  info "Stopping the driver..."
+  sudo systemctl stop python3-validity.service open-fprintd.service 2>/dev/null || true
+  sleep 1
+
+  if command -v validity-sensors-firmware >/dev/null 2>&1; then
+    info "Refreshing sensor firmware (needs network)..."
+    sudo validity-sensors-firmware || warn "validity-sensors-firmware failed — continuing"
+  fi
+
+  if [[ -f /usr/share/python-validity/playground/factory-reset.py ]]; then
+    info "Factory-resetting the sensor chip..."
+    sudo python3 /usr/share/python-validity/playground/factory-reset.py \
+      || warn "factory-reset reported an error"
+  else
+    warn "/usr/share/python-validity/playground/factory-reset.py not installed."
+  fi
+
+  sudo systemctl start python3-validity.service open-fprintd.service
+  sleep 2
+  timeout 15 fprintd-delete "$USER" 2>/dev/null || true
+  info "Sensor wiped. Re-run the script to enroll a finger."
+}
+
+verify_finger() {
+  local -a enrolled=()
+  local f choice
+
+  mapfile -t enrolled < <(enrolled_list)
+  (( ${#enrolled[@]} )) || { warn "no fingerprints enrolled yet — run --enroll first."; return 1; }
+
+  release_device
+  if [[ ${#enrolled[@]} -eq 1 ]]; then
+    f="${enrolled[0]}"
+  else
+    info "Enrolled: ${enrolled[*]}"
+    read -r -p "Finger to test (name, or 'any'): " choice
+    f="${choice:-any}"
+  fi
+
+  info "Verifying $f — place your finger on the sensor..."
+  if [[ "$f" == "any" ]]; then
+    fprintd-verify && VERIFY_OK=1
+  else
+    fprintd-verify -f "$f" && VERIFY_OK=1
+  fi
+}
+
+# --- 6. remove ---------------------------------------------------------------
+remove_finger() {
+  local -a enrolled=()
+  local f choice
+
+  mapfile -t enrolled < <(enrolled_list)
+  (( ${#enrolled[@]} )) || { warn "no fingerprints enrolled."; return 0; }
+
+  echo "Enrolled: ${enrolled[*]}"
+  read -r -p "Finger to remove (name, or 'all'): " choice
+  f="${choice:-}"
+  [[ -z "$f" ]] && { warn "nothing selected."; return 0; }
+
+  release_device
+  if [[ "$f" == "all" ]]; then
+    info "Removing all enrolled fingerprints..."
+    delete_all_prints
+  else
+    info "Removing $f..."
+    timeout 15 fprintd-delete -f "$f" "$USER" 2>/dev/null \
+      || warn "failed to remove $f (may not exist)."
+  fi
+  release_device
+  info "Done. Current prints: $(timeout 10 fprintd-list "$USER" 2>/dev/null | grep -c '^- #' || true)"
+}
+
+# --- 7. list ---------------------------------------------------------------
+list_prints() {
+  local -a enrolled=()
+  mapfile -t enrolled < <(enrolled_list)
+  if (( ${#enrolled[@]} )); then
+    info "Enrolled fingerprints for $USER:"
+    for f in "${enrolled[@]}"; do
+      echo "  - $f"
+    done
+  else
+    info "No fingerprints enrolled."
+  fi
+}
+
+# --- 8. status ---------------------------------------------------------------
+show_status() {
+  echo "=== Fingerprint Configuration Status ==="
+  echo
+  echo "Reader: $_READER_DESC ($_READER_ID)"
+  echo "Stack:  $STACK"
+  echo
+  echo "--- Packages ---"
+  if [[ "$STACK" == "validity" ]]; then
+    for p in python-validity open-fprintd fprintd-clients-git; do
+      pacman -Q "$p" >/dev/null 2>&1 && echo "  [installed] $p" || echo "  [missing] $p"
+    done
+    pacman -Q fprintd >/dev/null 2>&1 && echo "  [CONFLICT] fprintd (stock) installed — should be removed"
+  else
+    for p in fprintd libfprint; do
+      pacman -Q "$p" >/dev/null 2>&1 && echo "  [installed] $p" || echo "  [missing] $p"
+    done
+  fi
+  echo
+  echo "--- Services ---"
+  if [[ "$STACK" == "validity" ]]; then
+    for s in open-fprintd python3-validity python3-validity-suspend-hotfix open-fprintd-suspend open-fprintd-resume; do
+      systemctl is-active --quiet "$s" 2>/dev/null && echo "  [active] $s" || systemctl is-enabled --quiet "$s" 2>/dev/null && echo "  [enabled] $s" || echo "  [inactive] $s"
+    done
+  else
+    systemctl is-active --quiet fprintd 2>/dev/null && echo "  [active] fprintd" || echo "  [inactive] fprintd"
+  fi
+  echo
+  echo "--- PAM ---"
+  for f in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+    [[ -f "$f" ]] && grep -q pam_fprintd.so "$f" 2>/dev/null && echo "  [wired] $f" || echo "  [not wired] $f"
+  done
+  [[ -f "$LOCK_FILE" ]] && echo "  [wired] $LOCK_FILE" || echo "  [not wired] $LOCK_FILE"
+  echo
+  echo "--- Enrolled fingerprints ---"
+  list_prints
+}
+
+# --- 9. disable / enable PAM -------------------------------------------------
+toggle_pam() {
+  local action="$1"  # disable or enable
+  local pam_files=("/etc/pam.d/sudo" "/etc/pam.d/polkit-1")
+
+  if [[ "$action" == "disable" ]]; then
+    info "Disabling fingerprint PAM (keeping enrolled prints)..."
+    for f in "${pam_files[@]}"; do
+      [[ -f "$f" ]] && sudo sed -i '/pam_fprintd\.so/d; /omarchy-hw-laptop-closed/d' "$f" && echo "  $f: removed pam_fprintd lines"
+    done
+    if [[ -f "$LOCK_FILE" ]]; then
+      sudo mv "$LOCK_FILE" "${LOCK_FILE}.disabled" 2>/dev/null && echo "  $LOCK_FILE: renamed to .disabled"
+    fi
+    info "Fingerprint authentication disabled. Password-only fallback active."
+  else
+    info "Re-enabling fingerprint PAM..."
+    wire_pam
+    info "Fingerprint authentication re-enabled."
+  fi
+}
+
+# --- 10. uninstall -----------------------------------------------------------
+uninstall_stack() {
+  warn "This will remove ALL fingerprint packages, services, and PAM configuration."
+  local ans
+  read -r -p "Continue? [y/N] " ans
+  case "${ans,,}" in
+    y|yes) ;;
+    *) info "Aborted."; return 0 ;;
+  esac
+
+  info "Stopping and disabling services..."
+  if [[ "$STACK" == "validity" ]]; then
+    sudo systemctl disable --now open-fprintd python3-validity python3-validity-suspend-hotfix open-fprintd-suspend open-fprintd-resume 2>/dev/null || true
+    sudo pacman -Rns --noconfirm python-validity open-fprintd fprintd-clients-git 2>/dev/null || true
+    # also remove stock fprintd if it somehow got installed
+    sudo pacman -Rns --noconfirm fprintd libfprint 2>/dev/null || true
+  else
+    sudo systemctl disable --now fprintd 2>/dev/null || true
+    sudo pacman -Rns --noconfirm fprintd libfprint 2>/dev/null || true
+  fi
+
+  info "Removing PAM configuration..."
+  for f in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+    [[ -f "$f" ]] && sudo sed -i '/pam_fprintd\.so/d; /omarchy-hw-laptop-closed/d' "$f" && echo "  cleaned $f"
+  done
+  [[ -f "$LOCK_FILE" ]] && sudo rm -f "$LOCK_FILE" && echo "  removed $LOCK_FILE"
+  [[ -f "${LOCK_FILE}.disabled" ]] && sudo rm -f "${LOCK_FILE}.disabled"
+
+  info "Fingerprint stack completely removed."
+}
+
 # --- main -------------------------------------------------------------------
 MODE="full"
 case "${1:-}" in
   ""|--full) MODE="full" ;;
   --detect)  MODE="detect" ;;
   --enroll)  MODE="enroll" ;;
+  --verify)  MODE="verify" ;;
+  --reset)   MODE="reset" ;;
+  --remove)  MODE="remove" ;;
+  --list)    MODE="list" ;;
+  --status)  MODE="status" ;;
+  --disable) MODE="disable" ;;
+  --enable)  MODE="enable" ;;
+  --uninstall) MODE="uninstall" ;;
   --pam-only) MODE="pam-only" ;;
   -h|--help) usage ;;
   *) die "unknown argument '$1'";;
@@ -262,18 +585,45 @@ if [[ "$MODE" == "detect" ]]; then
   exit 0
 fi
 
-if [[ "$MODE" == "enroll" ]]; then
-  if stack_missing; then
-    die "driver stack not installed yet — run the full setup first."
-  fi
-  enroll_finger
-  echo
-  info "Enrollment update finished. Current prints: $(fprintd-list "$USER" 2>/dev/null | grep -c '^- #' || true)"
+if [[ "$MODE" == "list" ]]; then
+  list_prints
   exit 0
 fi
 
-# full and pam-only both need root later; grab the sudo timestamp up front
+if [[ "$MODE" == "status" ]]; then
+  show_status
+  exit 0
+fi
+
+# everything below edits system state or talks to the reader
 sudo -v
+
+if [[ "$MODE" == "reset" ]]; then
+  reset_sensor
+  exit 0
+fi
+
+if [[ "$MODE" == "remove" ]]; then
+  if stack_missing; then
+    die "driver stack not installed yet."
+  fi
+  remove_finger
+  exit 0
+fi
+
+if [[ "$MODE" == "disable" || "$MODE" == "enable" ]]; then
+  toggle_pam "$MODE"
+  exit 0
+fi
+
+if [[ "$MODE" == "uninstall" ]]; then
+  uninstall_stack
+  exit 0
+fi
+
+if [[ "$MODE" == "enroll" || "$MODE" == "verify" ]] && stack_missing; then
+  die "driver stack not installed yet — run the full setup first."
+fi
 
 if [[ "$MODE" == "full" ]]; then
   if stack_missing; then
@@ -285,11 +635,32 @@ if [[ "$MODE" == "full" ]]; then
   enroll_finger
 fi
 
-wire_pam
+if [[ "$MODE" == "enroll" ]]; then
+  enroll_finger
+  echo
+  info "Current prints: $(timeout 10 fprintd-list "$USER" 2>/dev/null | grep -c '^- #' || true)"
+  echo
+fi
 
-echo
-info "Done! Fingerprint authentication is configured."
-echo "  sudo and polkit prompts: fingerprint or password"
-echo "  lock screen: fingerprint (omarchy-lock-fingerprint)"
-echo
-echo "Test with: sudo -k true   (or)   omarchy lock"
+if [[ "$MODE" == "verify" ]]; then
+  verify_finger || warn "verification failed."
+  echo
+fi
+
+if [[ "$MODE" == "pam-only" ]] || (( VERIFY_OK )); then
+  wire_pam
+
+  echo
+  info "Done! Fingerprint authentication is configured."
+  echo "  sudo and polkit prompts: fingerprint or password"
+  echo "  lock screen: fingerprint (omarchy-lock-fingerprint)"
+  echo
+  echo "Test with: sudo -k true   (or)   omarchy lock"
+else
+  echo
+  warn "No finger verified, so PAM was left untouched — sudo/polkit/lock still ask for the password."
+  echo "  Fix it with:  bash $0 --verify     (test an enrolled finger)"
+  echo "                bash $0 --enroll     (add a finger)"
+  echo "                bash $0 --reset      (wipe a stale sensor, then enroll)"
+  exit 1
+fi
